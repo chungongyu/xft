@@ -69,7 +69,9 @@ class RLHFDataset(Dataset):
                  cache_dir='~/.cache/verl/rlhf',
                  chat_template_func=None,
                  return_raw_chat=False,
-                 truncation='error'):
+                 truncation='error',
+                 is_eval=False,
+                 config=None):
         if not isinstance(parquet_files, (List, ListConfig)):
             parquet_files = [parquet_files]
 
@@ -84,6 +86,10 @@ class RLHFDataset(Dataset):
         self.return_raw_chat = return_raw_chat
         self.chat_template_func = chat_template_func
         self.truncation = truncation
+
+        self.is_eval = is_eval
+        self.timestep = 1 # start from 1
+        self.config = config
 
         self._download()
         self._read_files_and_tokenize()
@@ -106,9 +112,11 @@ class RLHFDataset(Dataset):
         # filter out too long prompts
         tokenizer = self.tokenizer
         prompt_key = self.prompt_key
-        self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
-            tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
-                                                             axis=1)]
+
+        # nvm if prompt is too long
+        # self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
+        #     tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+        #                                                      axis=1)]
 
         print(f'filter dataset len: {len(self.dataframe)}')
 
@@ -123,20 +131,54 @@ class RLHFDataset(Dataset):
 
         chat = row_dict.pop(self.prompt_key)
 
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+        hint_slice_prop = 0.0
+        sliced_hint = ""
+        if "hint" in row_dict.keys() and not self.is_eval:
+            hint = row_dict.pop("hint")
+            num = min(5, len(hint))
+            separation = [round(_ / num * len(hint)) for _ in range(num + 1)]
+            separation[-1] = len(hint)
 
-        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
+            if self.config.trainer.uniform_sampling:
+                slice_length = np.random.choice(separation)
+            elif self.config.trainer.stage:
+                if self.timestep > self.config.trainer.total_training_steps_hint:
+                    slice_length = 0
+                else:
+                    current_timestep = self.timestep
+                    slice_length = num - current_timestep // (self.config.trainer.total_training_steps_hint // (num + 1))
+                    slice_length = np.clip(slice_length, 0, num)
+                    slice_length = separation[slice_length]
+            else:
+                if self.timestep > self.config.trainer.total_training_steps_hint:
+                    slice_length = 0
+                elif self.timestep < 101:
+                    slice_length = separation[-1]
+                else:
+                    current_timestep = self.timestep-100
+                    prob = self.config.trainer.lower_prob + 0.5 * (self.config.trainer.upper_prob - self.config.trainer.lower_prob) \
+                                * (1 + np.cos(np.pi * current_timestep / self.config.trainer.total_training_steps_hint))
+                    slice_length = (np.random.choice([0, 1], p=[1.0 - prob, prob], size=len(separation)-1)).sum()
+                    slice_length = separation[slice_length]
+            sliced_hint = "".join(hint[:slice_length])
+
+            hint_slice_prop = slice_length / len(hint)
+
+        input_ids, attention_mask, hint_ids, hint_mask = verl_F.tokenize_and_postprocess_data(prompt=chat[0]['content'],
                                                                          tokenizer=self.tokenizer,
                                                                          max_length=self.max_prompt_length,
                                                                          pad_token_id=self.tokenizer.pad_token_id,
                                                                          left_pad=True,
-                                                                         truncation=self.truncation)
+                                                                         truncation=self.truncation,
+                                                                         hint_prompt = sliced_hint)
 
         position_ids = compute_position_id_with_mask(attention_mask)
 
         row_dict['input_ids'] = input_ids[0]
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
+        row_dict['hint_slice_prop'] = hint_slice_prop
+        row_dict['hint_mask'] = hint_mask[0]
 
         # encode prompts without chat template
         if self.return_raw_chat:

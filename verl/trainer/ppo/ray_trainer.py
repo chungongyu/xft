@@ -34,6 +34,7 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+import wandb
 
 WorkerType = Type[Worker]
 
@@ -158,6 +159,7 @@ def _compute_response_info(batch):
 
     prompt_mask = batch.batch['attention_mask'][:, :-response_length]
     response_mask = batch.batch['attention_mask'][:, -response_length:]
+    hint_slice_prop = batch.non_tensor_batch['hint_slice_prop']
 
     prompt_length = prompt_mask.sum(-1).float()
     response_length = response_mask.sum(-1).float()  # (batch_size,)
@@ -166,13 +168,20 @@ def _compute_response_info(batch):
         response_mask=response_mask,
         prompt_length=prompt_length,
         response_length=response_length,
+        hint_slice_prop=hint_slice_prop,
     )
 
+def compute_acc(sequence_score, format_score=0.1, score=1.0):
+    format_acc = (np.sum(np.array(sequence_score) >= format_score - 1e-6)) / len(sequence_score)
+    correctness_acc = (np.sum(np.abs(np.array(sequence_score) - score) < 1e-6)) / len(sequence_score)
+    return format_acc, correctness_acc
 
-def compute_data_metrics(batch, use_critic=True):
+def compute_data_metrics(batch, use_critic=True, format_score=0.1, score=1.0):
     # TODO: add response length
     sequence_score = batch.batch['token_level_scores'].sum(-1)
     sequence_reward = batch.batch['token_level_rewards'].sum(-1)
+
+    format_acc, correctness_acc = compute_acc(sequence_score.detach().cpu().numpy(), format_score=format_score, score=score)
 
     advantages = batch.batch['advantages']
     returns = batch.batch['returns']
@@ -187,6 +196,7 @@ def compute_data_metrics(batch, use_critic=True):
     response_info = _compute_response_info(batch)
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
+    hint_slice_prop = response_info['hint_slice_prop'].astype(float)
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -205,6 +215,10 @@ def compute_data_metrics(batch, use_critic=True):
             torch.max(sequence_score).detach().item(),
         'critic/score/min':
             torch.min(sequence_score).detach().item(),
+        'critic/format_accuracy':
+            format_acc,
+        'critic/correctness_accuracy':
+            correctness_acc,
         # reward
         'critic/rewards/mean':
             torch.mean(sequence_reward).detach().item(),
@@ -253,6 +267,14 @@ def compute_data_metrics(batch, use_critic=True):
             torch.min(prompt_length).detach().item(),
         'prompt_length/clip_ratio':
             torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        
+        # hint slice length
+        'hint_slice_prop/mean':
+            np.mean(hint_slice_prop),
+        'hint_slice_prop/max':
+            np.max(hint_slice_prop),
+        'hint_slice_prop/min':
+            np.min(hint_slice_prop),
     }
     return metrics
 
@@ -349,7 +371,9 @@ class RayPPOTrainer(object):
                                          max_prompt_length=self.config.data.max_prompt_length,
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation='error')
+                                         truncation='right', # right for problems too long
+                                         is_eval=False,
+                                         config=self.config)
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=self.config.data.train_batch_size,
                                            shuffle=True,
@@ -362,7 +386,9 @@ class RayPPOTrainer(object):
                                        max_prompt_length=self.config.data.max_prompt_length,
                                        filter_prompts=True,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation='error')
+                                       truncation='right', # right for problems too long
+                                       is_eval=True,
+                                       config=self.config)
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=len(self.val_dataset),
                                          shuffle=True,
@@ -438,6 +464,9 @@ class RayPPOTrainer(object):
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            format_acc, correctness_acc = compute_acc(rewards, self.config.trainer.format_score, self.config.trainer.correctness_score)
+            metric_dict[f'val/test_score/{data_source}/format_accuracy'] = format_acc
+            metric_dict[f'val/test_score/{data_source}/correctness_accuracy'] = correctness_acc
 
         return metric_dict
 
@@ -514,14 +543,15 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg.init_model()
 
     def _save_checkpoint(self):
-        actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
+        local_dir = self.config.trainer.default_local_dir + '-' + str(wandb.run.id)
+        actor_local_path = os.path.join(local_dir, 'actor',
                                         f'global_step_{self.global_steps}')
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, 'actor')
         self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
 
         if self.use_critic:
-            critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
+            critic_local_path = os.path.join(local_dir, 'critic',
                                              f'global_step_{self.global_steps}')
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
                 self.config.trainer.default_hdfs_dir, 'critic')
@@ -574,6 +604,7 @@ class RayPPOTrainer(object):
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                print(f'epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}
 
@@ -670,13 +701,16 @@ class RayPPOTrainer(object):
                             self._save_checkpoint()
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, 
+                                                    format_score=self.config.trainer.format_score, score=self.config.trainer.correctness_score))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
                 self.global_steps += 1
+                self.train_dataloader.dataset.timestep = self.global_steps
+                self.val_dataloader.dataset.timestep = self.global_steps # synchronize the timestep
 
                 if self.global_steps >= self.total_training_steps:
 

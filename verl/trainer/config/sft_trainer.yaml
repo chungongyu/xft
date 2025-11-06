@@ -6,7 +6,7 @@ data:
   prompt_key: question
   response_key: answer
   max_length: 1024
-  truncation: error
+  truncation: right
   balance_dp_token: False
   chat_template: null
 model:
@@ -27,12 +27,13 @@ optim:
   clip_grad: 1.0
 
 trainer:
-  default_local_dir: /tmp/sft_model
+  seed: 1
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   default_hdfs_dir: hdfs://tmp/experiments/gsm8k/gemma-1.1-7b-it/ # change the hdfs path here
   resume_path: null
   project_name: gsm8k-sft
   experiment_name: test
-  total_epochs: 4
+  total_epochs: 5
   logger: ['console']
-  seed: 1
+  total_training_steps: 300
 
