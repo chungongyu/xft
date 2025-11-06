@@ -13,20 +13,46 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
+import verl.utils.reward_score.utils as utils
+import random
+    
 
-def compute_score(solution_str, ground_truth) -> float:
+def compute_score(solution_str, ground_truth, format_score=0.1, score=1., return_type=False) -> float:
+    question = ground_truth['question']
+    target = ground_truth['target']
+    answer = utils.extract_solution(solution_str=solution_str)
+    do_print = random.randint(1, 64) == 1
+
+    if do_print:
+        print(f"--------------------------------")
+        print(f"Question: {question} | Target: {target}")
+        print(f"Extracted answer: {answer}")
+        print(f"Solution string: {solution_str}")
+    
+    if answer is None:
+        if do_print:
+            print(f"No answer found")
+        return 0 if not return_type else (0, 'No answer found')
+
     retval = 0.
     try:
-        string_in_last_boxed = last_boxed_only_string(solution_str)
-        if string_in_last_boxed is not None:
-            answer = remove_boxed(string_in_last_boxed)
-            if is_equiv(answer, ground_truth):
-                retval = 1.
+        #string_in_last_boxed = last_boxed_only_string(solution_str)
+        #if string_in_last_boxed is not None:
+            #answer = remove_boxed(string_in_last_boxed)
+        if is_equiv(answer, target):
+            if do_print:
+                print("Correct answer")
+            return score if not return_type else (score, 'Correct answer')
+        else:
+            if do_print:
+                print("Incorrect answer")
+            return format_score if not return_type else (format_score, 'Incorrect answer')
     except Exception as e:
-        print(e)
+        if do_print:
+            print(e)
+        return format_score if not return_type else (format_score, f'Exception: {e}')
 
     return retval
-
 
 # string normalization from https://github.com/EleutherAI/lm-evaluation-harness/blob/master/lm_eval/tasks/hendrycks_math.py
 def is_equiv(str1, str2, verbose=False):

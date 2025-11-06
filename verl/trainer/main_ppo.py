@@ -17,15 +17,23 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 from verl import DataProto
 import torch
-from verl.utils.reward_score import gsm8k, math
+from verl.utils.reward_score import gsm8k, math, multiply, countdown, kk_logic
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+import numpy as np
+import random
 
 
 def _select_rm_score_fn(data_source):
-    if data_source == 'openai/gsm8k':
+    if data_source in ['openai/gsm8k', 'aime', 'amc'] :
         return gsm8k.compute_score
-    elif data_source == 'lighteval/MATH':
+    elif data_source in ['DigitalLearningGmbH/MATH-lighteval', 'cais/hle', 'math500', 'minerva', 'olympiad_bench']:
         return math.compute_score
+    elif "multiply" in data_source or "arithmetic" in data_source:
+        return multiply.compute_score
+    elif "countdown" in data_source:
+        return countdown.compute_score
+    elif "kk_logic" in data_source:
+        return kk_logic.compute_score
     else:
         raise NotImplementedError
 
@@ -34,9 +42,11 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine) -> None:
+    def __init__(self, tokenizer, num_examine, format_score, score) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        self.format_score = format_score
+        self.score = score
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -73,7 +83,7 @@ class RewardManager():
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
 
-            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
+            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score, score=self.score)
             reward_tensor[i, valid_response_length - 1] = score
 
             if data_source not in already_print_data_sources:
@@ -85,6 +95,12 @@ class RewardManager():
 
         return reward_tensor
 
+def set_seed(config):
+    np.random.seed(config.trainer.seed)
+    torch.manual_seed(config.trainer.seed)
+    torch.random.manual_seed(config.trainer.seed)
+    torch.cuda.manual_seed_all(config.trainer.seed)
+    random.seed(config.trainer.seed)
 
 import ray
 import hydra
@@ -167,12 +183,14 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, format_score=config.trainer.format_score, score=config.trainer.correctness_score)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, format_score=config.trainer.format_score, score=config.trainer.correctness_score)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+
+    set_seed(config)
 
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,

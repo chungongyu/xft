@@ -55,13 +55,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, return_prompt_logits=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch['responses'].size(-1)
+
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
             batch_size, seqlen = input_ids.shape
@@ -134,10 +135,16 @@ class DataParallelPPOActor(BasePPOActor):
                                            use_cache=False)  # prevent model thinks we are generating
                 logits = output.logits
                 logits.div_(temperature)
+
+                prompt_logits = logits[:, :-response_length]  # (bsz, prompt_length)
+
                 logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
+
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
+            if return_prompt_logits:
+                return entropy, log_probs, prompt_logits
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -208,7 +215,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'hint_mask']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
@@ -218,6 +225,8 @@ class DataParallelPPOActor(BasePPOActor):
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+
         for batch_idx, data in enumerate(dataloader):
             # split batch into micro_batches
             mini_batch = data
@@ -232,18 +241,38 @@ class DataParallelPPOActor(BasePPOActor):
 
             for data in micro_batches:
                 data = data.cuda()  # actor device is cpu when using offload
+                input_ids = data['input_ids']
                 responses = data['responses']
                 response_length = responses.size(1)
                 attention_mask = data['attention_mask']
                 response_mask = attention_mask[:, -response_length:]
                 old_log_prob = data['old_log_probs']
                 advantages = data['advantages']
+                hint_mask = data['hint_mask'][:, :-1]  # (bsz, prompt_length-1)
 
                 clip_ratio = self.config.clip_ratio
                 entropy_coeff = self.config.entropy_coeff
 
                 # all return: (bsz, response_length)
-                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                entropy, log_prob, prompt_logits = self._forward_micro_batch(micro_batch=data, temperature=temperature, return_prompt_logits=True)
+
+                shift_logits = prompt_logits[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:-response_length].contiguous()
+                shift_logits = shift_logits.view(-1, self.actor_module.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                shift_labels = shift_labels.to(shift_logits.device)
+
+                min_logits = shift_logits.min().detach().item()
+                max_logits = shift_logits.max().detach().item()
+                mean_logits = shift_logits.mean().detach().item()
+
+                shift_logits_clamp = torch.clamp(shift_logits, min=-100, max=100)
+
+                shift_logits_clipfrac = 1.0 - torch.sum(torch.eq(shift_logits, shift_logits_clamp)) / (shift_logits.shape[0] * shift_logits.shape[1])
+                shift_logits_clipfrac = shift_logits_clipfrac.detach().item()
+
+                sft_loss = loss_fct(shift_logits_clamp, shift_labels)
+                sft_loss = verl_F.masked_mean(sft_loss, hint_mask.reshape(-1))
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                               log_prob=log_prob,
@@ -255,6 +284,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # compute policy loss
                 policy_loss = pg_loss - entropy_loss * entropy_coeff
+                policy_loss = policy_loss + sft_loss * self.config.sft_loss_coef
 
                 if self.config.use_kl_loss:
                     ref_log_prob = data['ref_log_prob']
@@ -264,7 +294,7 @@ class DataParallelPPOActor(BasePPOActor):
                                                 kl_penalty=self.config.kl_loss_type)
                     kl_loss = masked_mean(kld, response_mask)
 
-                    policy_loss = policy_loss - kl_loss * self.config.kl_loss_coef
+                    policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
@@ -276,6 +306,11 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/pg_loss': pg_loss.detach().item(),
                     'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                     'actor/ppo_kl': ppo_kl.detach().item(),
+                    'actor/sft_loss': sft_loss.detach().item(),
+                    'actor/logits/min': min_logits,
+                    'actor/logits/max': max_logits,
+                    'actor/logits/mean': mean_logits,
+                    'actor/logits/clipfrac': shift_logits_clipfrac,
                 }
                 append_to_dict(metrics, data)
 

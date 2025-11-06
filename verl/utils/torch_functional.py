@@ -106,7 +106,7 @@ def masked_sum(values, mask, axis=None):
 
 def masked_mean(values, mask, axis=None):
     """Compute mean of tensor with a masked values."""
-    return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
+    return (values * mask).sum(axis=axis) / torch.clamp(mask.sum(axis=axis), min=1e-6)
 
 
 def masked_var(values, mask, unbiased=True):
@@ -227,7 +227,8 @@ def tokenize_and_postprocess_data(prompt: str,
                                   max_length: int,
                                   pad_token_id: int,
                                   left_pad=True,
-                                  truncation='error'):
+                                  truncation='error',
+                                  hint_prompt=""):
     """
     input_data is the output from tokenizer.
     """
@@ -237,6 +238,19 @@ def tokenize_and_postprocess_data(prompt: str,
 
     input_ids = input_data['input_ids']
     attention_mask = input_data['attention_mask']
+
+    hint_length = 0
+    hint_ids = torch.tensor([[]], dtype=torch.long)
+
+    if hint_prompt != "":
+        hint = tokenizer(hint_prompt, return_tensors='pt', add_special_tokens=False)
+        hint_ids = hint['input_ids']
+        input_ids = torch.cat([input_ids, hint_ids], dim=-1)
+        attention_mask = torch.cat([attention_mask, hint['attention_mask']], dim=-1)
+        hint_length = hint_ids.shape[-1]
+    
+    hint_mask = torch.zeros_like(attention_mask)
+    hint_mask[:, -hint_length-1: -1] = 1
 
     assert input_ids.ndim == 2
 
@@ -250,20 +264,26 @@ def tokenize_and_postprocess_data(prompt: str,
                                                 max_seq_len=max_length,
                                                 pad_token_id=0,
                                                 left_pad=left_pad)
+        hint_mask = pad_sequence_to_length(hint_mask,
+                                           max_seq_len=max_length,
+                                           pad_token_id=0,
+                                           left_pad=left_pad)
     elif sequence_length > max_length:
         if truncation == 'left':
             # actually, left truncation may not be reasonable
             input_ids = input_ids[:, -max_length:]
             attention_mask = attention_mask[:, -max_length:]
+            hint_mask = hint_mask[:, -max_length:]
         elif truncation == 'right':
             input_ids = input_ids[:, :max_length]
             attention_mask = attention_mask[:, :max_length]
+            hint_mask = hint_mask[:, :max_length]
         elif truncation == 'error':
             raise NotImplementedError(f'{sequence_length=} is larger than {max_length=}')
         else:
             raise NotImplementedError(f'Unknown truncation method {truncation}')
 
-    return input_ids, attention_mask
+    return input_ids, attention_mask, hint_ids, hint_mask
 
 
 def remove_pad_token(input_ids: torch.Tensor, attention_mask: torch.Tensor):

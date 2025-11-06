@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import re
+import random
+import verl.utils.reward_score.utils as utils
 
-
+'''
 def extract_solution(solution_str, method='strict'):
     assert method in ['strict', 'flexible']
 
@@ -39,9 +41,9 @@ def extract_solution(solution_str, method='strict'):
                 if final_answer not in invalid_str:
                     break
     return final_answer
-
-
-def compute_score(solution_str, ground_truth, method='strict', format_score=0., score=1.):
+'''
+    
+def compute_score(solution_str, ground_truth, method='strict', format_score=0.1, score=1., return_type=False):
     """The scoring function for GSM8k.
 
     Reference: Trung, Luong, et al. "Reft: Reasoning with reinforced fine-tuning." Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers). 2024.
@@ -53,11 +55,34 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0., 
         format_score: the score for the format
         score: the score for the correct answer
     """
-    answer = extract_solution(solution_str=solution_str, method=method)
+    question = ground_truth['question']
+    target = float(ground_truth['target'])
+    answer = utils.extract_solution(solution_str=solution_str)
+    do_print = random.randint(1, 64) == 1
+    
+    if do_print:
+        print(f"--------------------------------")
+        print(f"Question: {question} | Target: {target}")
+        print(f"Extracted answer: {answer}")
+        print(f"Solution string: {solution_str}")
+    
     if answer is None:
-        return 0
+        if do_print:
+            print(f"No answer found")
+        return 0 if not return_type else (0, 'No answer found')
     else:
-        if answer == ground_truth:
-            return score
-        else:
-            return format_score
+        try:
+            answer = float(answer)
+            if abs(answer - target) < 1e-5:
+                if do_print:
+                    print(f"Correct answer: {answer} = {target}")
+                return score if not return_type else (score, 'Correct answer')
+            else:
+                if do_print:
+                    print(f"Wrong answer: answer = {answer}, target = {target}")
+                return format_score if not return_type else (format_score, 'Wrong answer')
+        except:
+            if do_print:
+                print(f"Answer {answer} is not a number")
+            return format_score if not return_type else (format_score, 'Answer is not a number')
+    

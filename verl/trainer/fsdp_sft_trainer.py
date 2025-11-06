@@ -43,6 +43,8 @@ from torch.distributed.device_mesh import DeviceMesh
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.debug import log_gpu_memory_usage
+import wandb
+import random
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
@@ -202,7 +204,7 @@ class FSDPSFTTrainer(object):
         log_gpu_memory_usage('After initialize optimizer', logger=logger)
 
         steps_per_epoch = len(self.train_dataloader)
-        total_steps = steps_per_epoch * self.config.trainer.total_epochs
+        total_steps = min(steps_per_epoch * self.config.trainer.total_epochs, self.config.trainer.total_training_steps)
 
         if self.device_mesh.get_rank() == 0:
             print(
@@ -216,7 +218,7 @@ class FSDPSFTTrainer(object):
                                                             num_training_steps=total_steps)
 
     def _compute_loss(self, batch):
-        loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
+        loss_mask = batch.pop('loss_mask')[:, :-1].cuda()
         labels = batch['input_ids'][:, 1:].cuda()
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -226,7 +228,18 @@ class FSDPSFTTrainer(object):
                                      use_cache=False)  # prevent model thinks it it generating
 
         logits = output.logits
-
+        
+        for i in range(output.logits.shape[0]):
+            if random.randint(1, 64) == 1:
+                predicted_token_id = torch.argmax(logits[i], dim=-1)[:-1][loss_mask[i] == 1]
+                predicted_word = self.tokenizer.decode(predicted_token_id, skip_special_tokens=True)
+                question = self.tokenizer.decode(batch['input_ids'][i], skip_special_tokens=True)
+                print("=================================================")
+                print(f'Question and Ground Truth: {question}')
+                print("*************************************************")
+                print(f'Predicted word: {predicted_word}')
+                print("=================================================")
+        loss_mask = loss_mask.reshape(-1)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels.contiguous()
         # Flatten the tokens
@@ -299,7 +312,9 @@ class FSDPSFTTrainer(object):
         with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
             state_dict = self.fsdp_model.state_dict()
 
-        path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
+        local_dir = self.config.trainer.default_local_dir + '-' + str(wandb.run.id)
+        path = os.path.join(local_dir, 'actor',
+                                    f'global_step_{step}')
         # save huggingface model
         if self.device_mesh.get_rank() == 0:
             os.makedirs(path, exist_ok=True)
@@ -314,22 +329,38 @@ class FSDPSFTTrainer(object):
         rank = self.device_mesh.get_rank()
 
         # TODO: add a unified tracking
+        from omegaconf import OmegaConf
         if rank == 0:
             tracking = Tracking(project_name=self.config.trainer.project_name,
                                 experiment_name=self.config.trainer.experiment_name,
-                                default_backend=self.config.trainer.logger)
+                                default_backend=self.config.trainer.logger,
+                                config=OmegaConf.to_container(self.config, resolve=True))
 
         global_step = 0
 
         # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
+        if self.config.trainer.get('val_before_train', True):
+            val_losses = []
+            for data in self.val_dataloader:
+                data = TensorDict(data, batch_size=self.config.data.micro_batch_size).cuda()
+                val_loss = self.validation_step(data)
+                val_losses.append(val_loss)
+            if rank == 0:
+                val_loss = torch.mean(torch.stack(val_losses))
+                metric = {'val/loss': val_loss.detach().item()}
+                tracking.log(data=metric, step=global_step)
 
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
+            is_complete = False
             for data in self.train_dataloader:
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
+                if global_step >= self.config.trainer.total_training_steps:
+                    is_complete = True
+                    break
                 global_step += 1
 
             # validation
@@ -344,8 +375,12 @@ class FSDPSFTTrainer(object):
                 tracking.log(data=metric, step=global_step)
             torch.distributed.barrier()
 
-            # save checkpoint
-            self.save_checkpoint(step=global_step)
+            if is_complete:
+                break
+        self.save_checkpoint(step=global_step)
+        return global_step
+        # save checkpoint
+
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
@@ -354,15 +389,17 @@ import hydra
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.utils.distributed import initialize_global_process_group
-
+from verl.trainer.main_ppo import set_seed
 
 @hydra.main(config_path='config', config_name='sft_trainer', version_base=None)
 def main(config):
     local_rank, rank, world_size = initialize_global_process_group()
+    set_seed(config)
 
     device_mesh = init_device_mesh(device_type='cuda', mesh_shape=(world_size,), mesh_dim_names=('dp',))
     trainer = FSDPSFTTrainer(config=config, device_mesh=device_mesh)
-    trainer.fit()
+    checkpoint_idx = trainer.fit()
+    wandb.finish()
 
 
 if __name__ == '__main__':
